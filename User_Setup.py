@@ -11,6 +11,13 @@ CONFIG_DIR = SCRIPT_DIR  # All repo files live alongside this script
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
+def user_home() -> Path:
+    """Return the real user's home, even when the script is running under sudo."""
+    import pwd
+    sudo_user = os.environ.get("SUDO_USER")
+    if sudo_user:
+        return Path(pwd.getpwnam(sudo_user).pw_dir)
+    return Path.home()
 
 def run(cmd, check=False):
     if isinstance(cmd, str):
