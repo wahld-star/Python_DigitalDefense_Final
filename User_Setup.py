@@ -7,7 +7,7 @@ import time
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).parent
-CONFIG_DIR = SCRIPT_DIR  # All repo files live alongside this script
+CONFIG_DIR = SCRIPT_DIR
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -31,12 +31,17 @@ def get_real_uid() -> int:
 def copy_with_ownership(src: Path, dst: Path):
     """Copy a file and restore the real user's ownership when running as sudo."""
     shutil.copy2(src, dst)
+    fix_ownership(dst)
+
+
+def fix_ownership(path: Path):
+    """Restore the real user's ownership on a file or directory under sudo."""
     if os.geteuid() == 0:
         import pwd
         sudo_user = os.environ.get("SUDO_USER")
         if sudo_user:
             pw = pwd.getpwnam(sudo_user)
-            os.chown(dst, pw.pw_uid, pw.pw_gid)
+            os.chown(path, pw.pw_uid, pw.pw_gid)
 
 
 def run(cmd, check=False):
@@ -186,116 +191,16 @@ def setup_terminal():
     print("    Terminal settings applied.")
 
 
-# ── 3. Keyboard shortcut: open Terminal from Finder (interactive) ─────────────
-
-# Maps user-friendly modifier names → macOS pbs/NSUserKeyEquivalents symbols.
-# @ = Cmd  ^  = Ctrl  ~ = Option  $ = Shift
-_MODIFIERS = {
-    "cmd": "@", "command": "@",
-    "ctrl": "^", "control": "^",
-    "opt": "~", "option": "~", "alt": "~",
-    "shift": "$",
-}
-
-
-def parse_shortcut(raw: str):
-    """
-    Convert a human-readable combo such as 'ctrl+option+t' into the pbs
-    modifier string '^~t'. Returns None if the input cannot be parsed or
-    contains no plain key character.
-    """
-    parts = [p.strip().lower() for p in raw.replace(",", "+").split("+")]
-    modifiers = ""
-    key = None
-
-    for part in parts:
-        if part in _MODIFIERS:
-            symbol = _MODIFIERS[part]
-            if symbol not in modifiers:   # avoid duplicates
-                modifiers += symbol
-        elif len(part) == 1:
-            key = part
-        else:
-            return None  # unrecognised token
-
-    if key is None:
-        return None
-    return modifiers + key
-
-
-def shortcut_in_use(pbs_code: str) -> bool:
-    """
-    Return True if pbs_code (e.g. '^~t') appears in any of the three
-    places macOS stores keyboard shortcut assignments:
-      • Global NSUserKeyEquivalents
-      • Finder-specific NSUserKeyEquivalents
-      • pbs NSServicesStatus (already-registered services)
-    """
-    checks = [
-        (["defaults", "read", "-g", "NSUserKeyEquivalents"],           "global shortcuts"),
-        (["defaults", "read", "com.apple.finder", "NSUserKeyEquivalents"], "Finder shortcuts"),
-        (["defaults", "read", "pbs", "NSServicesStatus"],              "service shortcuts"),
-    ]
-    for cmd, label in checks:
-        result = run(cmd)
-        if result.returncode == 0 and pbs_code in result.stdout:
-            print(f"    Conflict: '{pbs_code}' is already used in {label}.")
-            return True
-    return False
-
-
-def prompt_for_shortcut():
-    """
-    Interactively ask the user for a keyboard shortcut, validate the format,
-    and verify there are no conflicts. Returns the pbs-format string or None
-    if the user chooses to skip.
-    """
-    print()
-    print("  Set a keyboard shortcut for 'New Terminal Here'")
-    print("  ─────────────────────────────────────────────────")
-    print("  Format: modifiers separated by '+', then the key.")
-    print("  Modifiers: cmd  ctrl  opt (option)  shift")
-    print("  Example:   ctrl+option+t   or   cmd+shift+t")
-    print()
-    print("  Press Enter with no input to skip and set it manually later.")
-    print("  (System Settings > Keyboard > Keyboard Shortcuts > Services)")
-    print()
-
-    while True:
-        raw = input("  Shortcut: ").strip()
-
-        if not raw:
-            print()
-            print("    Skipped. The 'New Terminal Here' service is installed but")
-            print("    has no shortcut. Assign one later in:")
-            print("    System Settings > Keyboard > Keyboard Shortcuts >")
-            print("    Services > Files & Folders > New Terminal Here")
-            return None
-
-        parsed = parse_shortcut(raw)
-
-        if parsed is None:
-            print("    Could not parse that input — try again (e.g. 'ctrl+option+t').")
-            continue
-
-        # Require at least one modifier to avoid accidental single-key capture
-        if not any(sym in parsed for sym in _MODIFIERS.values()):
-            print("    Include at least one modifier (ctrl, cmd, opt, shift).")
-            continue
-
-        print(f"    Checking '{raw}'  →  pbs code '{parsed}' ...")
-        if shortcut_in_use(parsed):
-            print(f"    '{raw}' is already in use — pick a different combination.")
-            continue
-
-        print(f"    '{raw}' is available.")
-        return parsed
+# ── 3. Keyboard shortcut: open Terminal from Finder ──────────────────────────
+# Fixed shortcut: Option+Shift+\
+# macOS modifier encoding:  ~ = Option   $ = Shift
+TERMINAL_SHORTCUT = "~$\\"
 
 
 def setup_terminal_shortcut():
     """
-    Install the 'New Terminal Here' Automator Quick Action and let the user
-    choose (and validate) their own keyboard shortcut for it.
+    Install the 'New Terminal Here' Automator Quick Action and bind it to
+    Option+Shift+\\ in Finder.
     """
     print("[3/5] Installing 'New Terminal Here' service...")
 
@@ -420,37 +325,33 @@ def setup_terminal_shortcut():
 
     print(f"    Service '{workflow_name}' written to ~/Library/Services/.")
 
-    # ── Interactive shortcut selection ─────────────────────────────────────────
-    shortcut = prompt_for_shortcut()
+    # ── Register the fixed shortcut (Option+Shift+\) ───────────────────────────
+    shortcut = TERMINAL_SHORTCUT
 
-    if shortcut:
-        # ── Method 1: Finder NSUserKeyEquivalents ──────────────────────────────
-        # This is the same mechanism System Settings uses: it matches the shortcut
-        # to any Finder menu item (including Services submenu items) by display name.
-        # This is the most reliable way to bind a shortcut to a named service.
-        run([
-            "defaults", "write", "com.apple.finder", "NSUserKeyEquivalents",
-            "-dict-add", workflow_name, shortcut,
-        ])
+    # Method 1: Finder NSUserKeyEquivalents — binds by menu item display name,
+    # the same mechanism System Settings uses for app-specific shortcuts.
+    run([
+        "defaults", "write", "com.apple.finder", "NSUserKeyEquivalents",
+        "-dict-add", workflow_name, shortcut,
+    ])
 
-        # ── Method 2: pbs NSServicesStatus ────────────────────────────────────
-        # Enables the service in the Services / context menus and records the
-        # shortcut in the Services broker database as a belt-and-suspenders backup.
-        pbs_key = f"Finder - {workflow_name} - runWorkflow"
-        run([
-            "defaults", "write", "pbs", "NSServicesStatus",
-            "-dict-add", pbs_key,
-            (
-                f"{{enabled_context_menu = 1; enabled_services_menu = 1; "
-                f'key_equivalent = "{shortcut}"; '
-                f"presentation_modes = {{ContextMenu = 1; ServicesMenu = 1;}};}}"
-            ),
-        ])
+    # Method 2: pbs NSServicesStatus — enables the service in the Services /
+    # context menus and records the shortcut in the Services broker database.
+    pbs_key = f"Finder - {workflow_name} - runWorkflow"
+    run([
+        "defaults", "write", "pbs", "NSServicesStatus",
+        "-dict-add", pbs_key,
+        (
+            f"{{enabled_context_menu = 1; enabled_services_menu = 1; "
+            f'key_equivalent = "{shortcut}"; '
+            f"presentation_modes = {{ContextMenu = 1; ServicesMenu = 1;}};}}"
+        ),
+    ])
 
-        # Force pbs to rescan services so both registrations take effect now.
-        run("/System/Library/CoreServices/pbs -flush")
-        run("killall pbs", check=False)
-        print(f"    Shortcut '{shortcut}' registered.")
+    # Force pbs to rescan services so both registrations take effect immediately.
+    run("/System/Library/CoreServices/pbs -flush")
+    run("killall pbs", check=False)
+    print(f"    Shortcut set: Option+Shift+\\ opens Terminal at the selected folder.")
 
 
 # ── 4. 'la' alias ─────────────────────────────────────────────────────────────
@@ -517,7 +418,7 @@ def main():
     print("Summary of changes:")
     print("  [1] Finder sidebar: Applications, Utilities, Users, Frameworks")
     print("  [2] Terminal: custom theme applied")
-    print("  [3] Service: 'New Terminal Here' installed in ~/Library/Services/")
+    print("  [3] Shortcut: Option+Shift+\\ opens Terminal at the selected Finder folder")
     print("  [4] Alias: 'la' = 'ls -la'  (open a new terminal to activate)")
     print("  [5] Screenshots: saved to clipboard instead of Desktop")
     print("=" * 50)
