@@ -19,6 +19,26 @@ def user_home() -> Path:
         return Path(pwd.getpwnam(sudo_user).pw_dir)
     return Path.home()
 
+
+def get_real_uid() -> int:
+    """Return the real user's UID — sudo sets SUDO_UID so we don't use root's."""
+    sudo_uid = os.environ.get("SUDO_UID")
+    if sudo_uid:
+        return int(sudo_uid)
+    return os.getuid()
+
+
+def copy_with_ownership(src: Path, dst: Path):
+    """Copy a file and restore the real user's ownership when running as sudo."""
+    shutil.copy2(src, dst)
+    if os.geteuid() == 0:
+        import pwd
+        sudo_user = os.environ.get("SUDO_USER")
+        if sudo_user:
+            pw = pwd.getpwnam(sudo_user)
+            os.chown(dst, pw.pw_uid, pw.pw_gid)
+
+
 def run(cmd, check=False):
     if isinstance(cmd, str):
         return subprocess.run(cmd, shell=True, capture_output=True, text=True, check=check)
@@ -107,12 +127,20 @@ def setup_finder_sidebar():
     """Copy pre-configured sidebar lists: Applications, Utilities, Users, Frameworks."""
     print("[1/5] Configuring Finder sidebar...")
 
-    # Destination is always inside the user's home Library, not the script dir.
-    sfl_dir = Path.home() / "Library/Application Support/com.apple.sharedfilelist"
+    uid = get_real_uid()
+    sfl_dir = user_home() / "Library/Application Support/com.apple.sharedfilelist"
     sfl_dir.mkdir(parents=True, exist_ok=True)
 
+    # Quit Finder, then stop sharedfilelistd via launchctl before touching its
+    # files — otherwise the running daemon overwrites whatever we copy.
     run("osascript -e 'tell application \"Finder\" to quit'")
-    time.sleep(1)
+    run(
+        f"launchctl bootout gui/{uid} "
+        "/System/Library/LaunchAgents/com.apple.sharedfilelistd.plist",
+        check=False,
+    )
+    run("killall sharedfilelistd", check=False)  # belt-and-suspenders
+    time.sleep(2)
 
     sidebar_files = [
         "com.apple.LSSharedFileList.FavoriteItems.sfl4",
@@ -123,9 +151,17 @@ def setup_finder_sidebar():
     for fname in sidebar_files:
         src = CONFIG_DIR / fname
         if src.exists():
-            shutil.copy2(src, sfl_dir / fname)
+            copy_with_ownership(src, sfl_dir / fname)
         else:
             print(f"    Warning: {fname} not found in {CONFIG_DIR}, skipping.")
+
+    # Restart the daemon so it loads our new files from a clean state.
+    run(
+        f"launchctl bootstrap gui/{uid} "
+        "/System/Library/LaunchAgents/com.apple.sharedfilelistd.plist",
+        check=False,
+    )
+    time.sleep(1)
 
     print("    Finder sidebar configured (Applications, Utilities, Users, Frameworks).")
 
@@ -141,7 +177,7 @@ def setup_terminal():
         print(f"    Warning: com.apple.Terminal.plist not found in {CONFIG_DIR}, skipping.")
         return
 
-    dst = Path.home() / "Library/Preferences/com.apple.Terminal.plist"
+    dst = user_home() / "Library/Preferences/com.apple.Terminal.plist"
 
     run("osascript -e 'tell application \"Terminal\" to quit'")
     time.sleep(1)
@@ -263,7 +299,7 @@ def setup_terminal_shortcut():
     """
     print("[3/5] Installing 'New Terminal Here' service...")
 
-    services_dir = Path.home() / "Library/Services"
+    services_dir = user_home() / "Library/Services"
     services_dir.mkdir(exist_ok=True)
 
     workflow_name = "New Terminal Here"
@@ -388,8 +424,18 @@ def setup_terminal_shortcut():
     shortcut = prompt_for_shortcut()
 
     if shortcut:
-        # Register via pbs — the macOS Services broker.
-        # Key format: "AppName - ServiceDisplayName - MessageName"
+        # ── Method 1: Finder NSUserKeyEquivalents ──────────────────────────────
+        # This is the same mechanism System Settings uses: it matches the shortcut
+        # to any Finder menu item (including Services submenu items) by display name.
+        # This is the most reliable way to bind a shortcut to a named service.
+        run([
+            "defaults", "write", "com.apple.finder", "NSUserKeyEquivalents",
+            "-dict-add", workflow_name, shortcut,
+        ])
+
+        # ── Method 2: pbs NSServicesStatus ────────────────────────────────────
+        # Enables the service in the Services / context menus and records the
+        # shortcut in the Services broker database as a belt-and-suspenders backup.
         pbs_key = f"Finder - {workflow_name} - runWorkflow"
         run([
             "defaults", "write", "pbs", "NSServicesStatus",
@@ -400,8 +446,10 @@ def setup_terminal_shortcut():
                 f"presentation_modes = {{ContextMenu = 1; ServicesMenu = 1;}};}}"
             ),
         ])
-        # Tell pbs to reload so the shortcut takes effect immediately
+
+        # Force pbs to rescan services so both registrations take effect now.
         run("/System/Library/CoreServices/pbs -flush")
+        run("killall pbs", check=False)
         print(f"    Shortcut '{shortcut}' registered.")
 
 
@@ -411,7 +459,7 @@ def setup_la_alias():
     """Append 'alias la=ls -la' to ~/.zshrc if not already present."""
     print("[4/5] Adding 'la' alias...")
 
-    zshrc = Path.home() / ".zshrc"
+    zshrc = user_home() / ".zshrc"
     alias_line = "alias la='ls -la'"
 
     existing = zshrc.read_text() if zshrc.exists() else ""
